@@ -60,10 +60,12 @@ def download_video():
         # Extract username from URL for better filename
         username = extract_username_from_url(tiktok_url) or "tiktok_user"
             
-        # Configure yt-dlp options
+        # Configure yt-dlp options - FIXED to use dictionary for outtmpl
         ydl_opts = {
             'format': 'best',
-            'outtmpl': os.path.join(download_path, '%(title)s.%(ext)s'),
+            'outtmpl': {
+                'default': os.path.join(download_path, '%(title)s.%(ext)s')
+            },
             'no_warnings': True,
             'quiet': False,
             'noplaylist': True,
@@ -97,8 +99,10 @@ def download_video():
             sanitized_filename = sanitize_filename(custom_filename)
             final_filename = f"{sanitized_filename}.{ext}"
             
-            # Update output template with sanitized filename
-            ydl_opts['outtmpl'] = os.path.join(download_path, final_filename)
+            # Update output template with sanitized filename - FIXED to use dictionary
+            ydl_opts['outtmpl'] = {
+                'default': os.path.join(download_path, final_filename)
+            }
             
             # Download the actual video
             logger.info(f"Downloading video as: {final_filename}")
