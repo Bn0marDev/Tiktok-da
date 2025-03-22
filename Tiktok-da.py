@@ -1,10 +1,13 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import yt_dlp
 import re
 import os
 import uuid
 import logging
 from flask_cors import CORS
+import time
+from urllib.parse import urlparse
+import shutil
 
 app = Flask(__name__)
 CORS(app)
@@ -19,10 +22,23 @@ if not os.path.exists(DOWNLOAD_FOLDER):
     os.makedirs(DOWNLOAD_FOLDER)
 
 def sanitize_filename(filename):
-    # Remove special characters
-    filename = re.sub(r'[^\w\s.-]', '', filename)
+    # Remove special characters and non-Arabic/English characters
+    filename = re.sub(r'[^\w\s.-أ-يءؤةئآإا]', '', filename)
+    # Replace spaces with underscores
+    filename = re.sub(r'\s+', '_', filename)
     # Limit filename length
-    return filename[:100]
+    return filename[:80]
+
+def extract_username_from_url(url):
+    try:
+        parsed_url = urlparse(url)
+        path_parts = parsed_url.path.strip('/').split('/')
+        # TikTok URLs typically have the username as the first path component
+        if len(path_parts) > 0:
+            return path_parts[0]
+        return None
+    except:
+        return None
 
 @app.route('/download', methods=['POST'])
 def download_video():
@@ -40,6 +56,9 @@ def download_video():
         
         if not os.path.exists(download_path):
             os.makedirs(download_path)
+        
+        # Extract username from URL for better filename
+        username = extract_username_from_url(tiktok_url) or "tiktok_user"
             
         # Configure yt-dlp options
         ydl_opts = {
@@ -58,77 +77,102 @@ def download_video():
             if not info_dict:
                 return jsonify({'error': 'Could not extract video information'}), 400
                 
-            title = info_dict.get('title', 'tiktok_video')
+            # Get video details for better filename
+            title = info_dict.get('title', 'video')
+            description = info_dict.get('description', '')
+            upload_date = info_dict.get('upload_date', '')
             ext = info_dict.get('ext', 'mp4')
-            sanitized_title = sanitize_filename(title)
+            
+            # Create meaningful filename
+            # Format: username_firstWordsOfTitle_date.mp4
+            short_title = ' '.join((title or '').split()[:5])  # First 5 words of title
+            date_formatted = ''
+            if upload_date and len(upload_date) == 8:
+                date_formatted = f"{upload_date[0:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+            
+            custom_filename = f"{username}_{short_title}"
+            if date_formatted:
+                custom_filename += f"_{date_formatted}"
+                
+            sanitized_filename = sanitize_filename(custom_filename)
+            final_filename = f"{sanitized_filename}.{ext}"
             
             # Update output template with sanitized filename
-            ydl_opts['outtmpl'] = os.path.join(download_path, f'{sanitized_title}.%(ext)s')
+            ydl_opts['outtmpl'] = os.path.join(download_path, final_filename)
             
             # Download the actual video
-            logger.info(f"Downloading video: {sanitized_title}")
+            logger.info(f"Downloading video as: {final_filename}")
             ydl.download([tiktok_url])
             
-            # Find the downloaded file
-            downloaded_files = os.listdir(download_path)
-            if not downloaded_files:
-                return jsonify({'error': 'Failed to download video'}), 500
+            # Verify the file exists
+            expected_file_path = os.path.join(download_path, final_filename)
+            
+            if not os.path.exists(expected_file_path):
+                # If the expected filename doesn't exist, look for any file in the directory
+                downloaded_files = os.listdir(download_path)
+                if not downloaded_files:
+                    return jsonify({'error': 'Failed to download video'}), 500
                 
-            video_filename = downloaded_files[0]
-            video_path = os.path.join(download_path, video_filename)
+                # Take the first file and rename it
+                original_file = os.path.join(download_path, downloaded_files[0])
+                os.rename(original_file, expected_file_path)
             
-            # In a real production environment, you'd save this file to a cloud storage
-            # and provide a URL for download. For this example, we'll assume a simple
-            # static file serving setup.
+            # For this example, we're assuming static file serving
+            # In production, use proper cloud storage
+            download_url = f"/static/downloads/{download_id}/{final_filename}"
             
-            # The URL should point to where your files are publicly accessible
-            download_url = f"/static/downloads/{download_id}/{video_filename}"
-            
-            # Static URL for demonstration - in production use cloud storage URLs
-            # or proper file serving mechanisms
-            server_base_url = request.host_url.rstrip('/')
+            # Static URL for demonstration
+            server_base_url = request.url_root.rstrip('/')
             public_url = f"{server_base_url}{download_url}"
             
-            logger.info(f"Download successful. File: {video_filename}")
+            logger.info(f"Download successful. File: {final_filename}")
             
             return jsonify({
                 'success': True,
-                'filename': video_filename,
+                'filename': final_filename,
                 'downloadUrl': public_url,
-                'title': sanitized_title
+                'title': sanitized_filename
             })
     
     except Exception as e:
         logger.error(f"Error processing download: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
-# Route to serve downloaded files
 @app.route('/static/downloads/<download_id>/<filename>', methods=['GET'])
 def serve_download(download_id, filename):
     file_path = os.path.join(DOWNLOAD_FOLDER, download_id, filename)
     if os.path.exists(file_path):
-        # Set cache control and content disposition
-        response = app.send_static_file(file_path)
-        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response.headers["Content-Disposition"] = f"attachment; filename={filename}"
-        return response
+        return send_from_directory(os.path.dirname(file_path), 
+                                  os.path.basename(file_path), 
+                                  as_attachment=True,
+                                  download_name=filename)
     else:
         return jsonify({'error': 'File not found'}), 404
 
-# Cleanup function to remove old downloads (could be called periodically)
+# Cleanup old downloads (runs every hour)
 def cleanup_old_downloads():
-    import shutil
-    import time
-    
-    current_time = time.time()
-    for folder in os.listdir(DOWNLOAD_FOLDER):
-        folder_path = os.path.join(DOWNLOAD_FOLDER, folder)
-        if os.path.isdir(folder_path):
-            # Get folder modification time
-            folder_time = os.path.getmtime(folder_path)
-            # If older than 1 hour, delete it
-            if current_time - folder_time > 3600:
-                shutil.rmtree(folder_path)
+    while True:
+        try:
+            logger.info("Running cleanup of old downloads")
+            current_time = time.time()
+            for folder in os.listdir(DOWNLOAD_FOLDER):
+                folder_path = os.path.join(DOWNLOAD_FOLDER, folder)
+                if os.path.isdir(folder_path):
+                    folder_time = os.path.getmtime(folder_path)
+                    # Delete folders older than 2 hours
+                    if current_time - folder_time > 7200:
+                        shutil.rmtree(folder_path)
+                        logger.info(f"Deleted old download: {folder}")
+        except Exception as e:
+            logger.error(f"Error in cleanup: {str(e)}")
+        
+        # Sleep for 1 hour
+        time.sleep(3600)
+
+import threading
+# Start cleanup in background thread
+cleanup_thread = threading.Thread(target=cleanup_old_downloads, daemon=True)
+cleanup_thread.start()
 
 if __name__ == '__main__':
     # Set the port based on environment variable or default to 5000
